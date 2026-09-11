@@ -21,11 +21,11 @@ function createPhoneScene(canvas) {
 
   function onMotion(e) {
     const total = e.accelerationIncludingGravity;
-    const linear = e.acceleration;
-    if (!total || !linear) return;
+if (!total) return;
 
-    const x = total.x - linear.x;
-    const z = total.z - linear.z;
+const linear = e.acceleration;
+const x = total.x - (linear?.x ?? 0);
+const z = total.z - (linear?.z ?? 0);
     if (!Number.isFinite(x) || !Number.isFinite(z) || Math.hypot(x, z) < 0.5) return;
 
     if (!hasGravity) {
