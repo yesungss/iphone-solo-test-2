@@ -15,6 +15,14 @@ function createPhoneScene(canvas) {
   let pending = false;
   let sensorTimer;
 
+  // 센서 충돌 및 흔들림 방지
+  let lastMotionAt = 0;
+  let orientationTarget = 0;
+
+  // 카툭튀로 인한 초기 기울기 보정값
+  let neutralRoll = null;
+  let neutralOrientation = null;
+
   function wrap(value) {
     return ((value + 180) % 360 + 360) % 360 - 180;
   }
@@ -36,30 +44,52 @@ function createPhoneScene(canvas) {
       return;
     }
 
+    lastMotionAt = performance.now();
+
     if (!hasGravity) {
       hasGravity = true;
       clearTimeout(sensorTimer);
       hideUnavailable();
     }
 
-    const roll = Math.atan2(x, -z) * 180 / Math.PI;
+    // 갤럭시 S23 기준: 화면이 하늘을 보면 z가 양수
+    const roll = Math.atan2(x, z) * 180 / Math.PI;
+
+    // 카툭튀로 생기는 초기 기울기를 0도로 보정
+    if (neutralRoll === null) {
+      neutralRoll = roll;
+      previous = 0;
+      unwrapped = 0;
+      target = 0;
+      return;
+    }
+
+    const relativeRoll = wrap(roll - neutralRoll);
 
     if (unwrapped === null) {
-      unwrapped = roll;
+      unwrapped = relativeRoll;
     } else {
       unwrapped += wrap(
-        roll - (previous ?? wrap(unwrapped))
+        relativeRoll - (previous ?? relativeRoll)
       );
     }
 
-    previous = roll;
-    target = Math.max(-180, Math.min(180, -2 * unwrapped));
+    previous = relativeRoll;
+
+    target = Math.max(
+      -180,
+      Math.min(180, -2 * unwrapped)
+    );
   }
 
-  // Android fallback.
-  // Galaxy S23에서 devicemotion 값이 비어 있을 때 사용합니다.
+  // Android fallback
   function onOrientation(e) {
     if (!Number.isFinite(e.gamma)) return;
+
+    // devicemotion이 정상 작동하면 orientation은 무시
+    if (performance.now() - lastMotionAt < 300) {
+      return;
+    }
 
     if (!hasGravity) {
       hasGravity = true;
@@ -67,12 +97,36 @@ function createPhoneScene(canvas) {
       hideUnavailable();
     }
 
-    target = Math.max(-180, Math.min(180, -2 * e.gamma));
+    // 카툭튀로 인한 초기 기울기를 0도로 보정
+    if (neutralOrientation === null) {
+      neutralOrientation = e.gamma;
+      orientationTarget = 0;
+      target = 0;
+      return;
+    }
+
+    const relativeGamma = e.gamma - neutralOrientation;
+
+    const nextTarget = Math.max(
+      -180,
+      Math.min(180, -2 * relativeGamma)
+    );
+
+    // 센서 지직거림 완화
+    orientationTarget +=
+      (nextTarget - orientationTarget) * 0.12;
+
+    target = orientationTarget;
   }
 
   document.addEventListener('visibilitychange', () => {
     previous = null;
     unwrapped = null;
+    neutralRoll = null;
+    neutralOrientation = null;
+    lastMotionAt = 0;
+    orientationTarget = 0;
+    target = 0;
   });
 
   function showGesture() {
@@ -83,14 +137,19 @@ function createPhoneScene(canvas) {
 
   // Motion permission
   async function enableMotion(fromTap = false) {
+    const hasMotion =
+      typeof DeviceMotionEvent !== 'undefined';
+
+    const hasOrientation =
+      typeof DeviceOrientationEvent !== 'undefined';
+
     if (
       !isSecureContext ||
-      (
-        typeof DeviceMotionEvent === 'undefined' &&
-        typeof DeviceOrientationEvent === 'undefined'
-      )
+      (!hasMotion && !hasOrientation)
     ) {
-      showUnavailable();
+      showUnavailable(
+        'This browser cannot access motion sensors.'
+      );
       return;
     }
 
@@ -100,15 +159,17 @@ function createPhoneScene(canvas) {
     enable.disabled = true;
 
     try {
+      // iPhone Safari용 권한 요청
       if (
-        typeof DeviceMotionEvent !== 'undefined' &&
+        hasMotion &&
         typeof DeviceMotionEvent.requestPermission === 'function'
       ) {
-        const state = await DeviceMotionEvent.requestPermission();
+        const state =
+          await DeviceMotionEvent.requestPermission();
 
         if (state !== 'granted') {
           showUnavailable(
-            'Motion access is off. Allow it for this page in Safari settings, then try again.',
+            'Motion access is off. Allow it for this page, then try again.',
             enableMotion
           );
           return;
@@ -121,7 +182,7 @@ function createPhoneScene(canvas) {
         motionSheet.close();
       }
 
-      if (typeof DeviceMotionEvent !== 'undefined') {
+      if (hasMotion) {
         window.addEventListener(
           'devicemotion',
           onMotion,
@@ -129,7 +190,7 @@ function createPhoneScene(canvas) {
         );
       }
 
-      if (typeof DeviceOrientationEvent !== 'undefined') {
+      if (hasOrientation) {
         window.addEventListener(
           'deviceorientation',
           onOrientation,
@@ -163,8 +224,15 @@ function createPhoneScene(canvas) {
   }
 
   window.addEventListener('pagehide', () => {
-    window.removeEventListener('devicemotion', onMotion);
-    window.removeEventListener('deviceorientation', onOrientation);
+    window.removeEventListener(
+      'devicemotion',
+      onMotion
+    );
+
+    window.removeEventListener(
+      'deviceorientation',
+      onOrientation
+    );
   });
 
   enable.addEventListener('click', () => {
