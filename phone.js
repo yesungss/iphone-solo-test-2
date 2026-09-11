@@ -16,14 +16,44 @@ function createPhoneScene(canvas) {
   let motionEnabled = false;
   let pending = false;
   let sensorTimer;
-  let lastOrientationAt = 0;
 
   function wrap(value) {
     return ((value + 180) % 360 + 360) % 360 - 180;
   }
 
-  function acceptRoll(roll) {
-    if (!Number.isFinite(roll)) return;
+  function onMotion(e) {
+    const total = e.accelerationIncludingGravity;
+    const linear = e.acceleration;
+
+    if (!total) return;
+
+    /*
+     * Android에서는 acceleration이 null인 경우가 있으므로
+     * accelerationIncludingGravity 값을 그대로 사용합니다.
+     */
+    if (isAndroid) {
+      if (
+        !Number.isFinite(total.x) ||
+        !Number.isFinite(total.z) ||
+        Math.hypot(total.x, total.z) < 0.5
+      ) {
+        return;
+      }
+    } else {
+      /*
+       * iPhone 원본 방식
+       */
+      if (!linear) return;
+
+      if (
+        !Number.isFinite(total.x) ||
+        !Number.isFinite(total.z) ||
+        !Number.isFinite(linear.x) ||
+        !Number.isFinite(linear.z)
+      ) {
+        return;
+      }
+    }
 
     if (!hasGravity) {
       hasGravity = true;
@@ -31,52 +61,13 @@ function createPhoneScene(canvas) {
       hideUnavailable();
     }
 
-    if (unwrapped === null) {
-      unwrapped = roll;
-    } else {
-      unwrapped += wrap(roll - (previous ?? wrap(unwrapped)));
-    }
+    const x = isAndroid
+      ? total.x
+      : total.x - linear.x;
 
-    previous = roll;
-
-    target = Math.max(
-      -180,
-      Math.min(180, -2 * unwrapped)
-    );
-  }
-
-  function onMotion(e) {
-    const total = e.accelerationIncludingGravity;
-    if (!total) return;
-
-    /*
-     * Android Chrome/Samsung Internet may return null for acceleration.
-     * In that case use accelerationIncludingGravity directly.
-     */
-    if (isAndroid) {
-      if (
-        performance.now() - lastOrientationAt < 1000 ||
-        !Number.isFinite(total.x) ||
-        !Number.isFinite(total.z)
-      ) {
-        return;
-      }
-
-      if (Math.hypot(total.x, total.z) < 0.5) return;
-
-      const roll = Math.atan2(total.x, -total.z) * 180 / Math.PI;
-      acceptRoll(roll);
-      return;
-    }
-
-    /*
-     * Original iPhone path — unchanged.
-     */
-    const linear = e.acceleration;
-    if (!linear) return;
-
-    const x = total.x - linear.x;
-    const z = total.z - linear.z;
+    const z = isAndroid
+      ? total.z
+      : total.z - linear.z;
 
     if (
       !Number.isFinite(x) ||
@@ -86,26 +77,32 @@ function createPhoneScene(canvas) {
       return;
     }
 
+    /*
+     * 원본과 동일한 roll 계산
+     */
     const roll = Math.atan2(x, -z) * 180 / Math.PI;
-    acceptRoll(roll);
-  }
 
-  function onOrientation(e) {
-    if (!isAndroid || !Number.isFinite(e.gamma)) return;
+    if (unwrapped === null) {
+      unwrapped = roll;
+    } else {
+      unwrapped += wrap(
+        roll - (previous ?? wrap(unwrapped))
+      );
+    }
 
-    lastOrientationAt = performance.now();
+    previous = roll;
 
     /*
-     * gamma is Android's left/right roll angle.
-     * The original -2x mapping is preserved.
+     * 원본과 동일한 접힘 배율과 범위
      */
-    acceptRoll(e.gamma);
+    target = Math.max(
+      -180,
+      Math.min(180, -2 * unwrapped)
+    );
   }
 
   document.addEventListener('visibilitychange', () => {
     previous = null;
-    unwrapped = null;
-    lastOrientationAt = 0;
   });
 
   function showGesture() {
@@ -116,15 +113,9 @@ function createPhoneScene(canvas) {
 
   // Motion permission
   async function enableMotion(fromTap = false) {
-    const hasMotion =
-      typeof DeviceMotionEvent !== 'undefined';
-
-    const hasOrientation =
-      typeof DeviceOrientationEvent !== 'undefined';
-
     if (
       !isSecureContext ||
-      (!hasMotion && !hasOrientation)
+      typeof DeviceMotionEvent === 'undefined'
     ) {
       showUnavailable();
       return;
@@ -136,12 +127,7 @@ function createPhoneScene(canvas) {
     enable.disabled = true;
 
     try {
-      /*
-       * iPhone Safari permission request.
-       * Android does not normally require this permission prompt.
-       */
       if (
-        hasMotion &&
         typeof DeviceMotionEvent.requestPermission === 'function'
       ) {
         const state =
@@ -162,21 +148,11 @@ function createPhoneScene(canvas) {
         motionSheet.close();
       }
 
-      if (hasMotion) {
-        window.addEventListener(
-          'devicemotion',
-          onMotion,
-          { passive: true }
-        );
-      }
-
-      if (isAndroid && hasOrientation) {
-        window.addEventListener(
-          'deviceorientation',
-          onOrientation,
-          { passive: true }
-        );
-      }
+      window.addEventListener(
+        'devicemotion',
+        onMotion,
+        { passive: true }
+      );
 
       onboard(showGesture);
 
@@ -203,16 +179,26 @@ function createPhoneScene(canvas) {
     }
   }
 
+  document.addEventListener('visibilitychange', () => {
+    previous = null;
+    unwrapped = null;
+  });
+
   window.addEventListener('pagehide', () => {
     window.removeEventListener(
       'devicemotion',
       onMotion
     );
+  });
 
-    window.removeEventListener(
-      'deviceorientation',
-      onOrientation
-    );
+  window.addEventListener('pageshow', () => {
+    if (motionEnabled) {
+      window.addEventListener(
+        'devicemotion',
+        onMotion,
+        { passive: true }
+      );
+    }
   });
 
   enable.addEventListener('click', () => {
@@ -235,9 +221,6 @@ function createPhoneScene(canvas) {
     },
 
     frame(dt) {
-      /*
-       * Original easing and rendering logic — unchanged.
-       */
       display +=
         (target - display) *
         (1 - Math.exp(-dt * FOLLOW));
