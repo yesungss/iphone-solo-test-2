@@ -149,7 +149,21 @@ function createStage(canvas, fragment, extra = []) {
     gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
+  const textureLimit = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    /Android/i.test(navigator.userAgent) ? 2048 : Infinity);
+
   function upload(image) {
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    const scale = Math.min(1, textureLimit / Math.max(width, height));
+    if (scale < 1) {
+      const resized = document.createElement('canvas');
+      resized.width = Math.max(1, Math.round(width * scale));
+      resized.height = Math.max(1, Math.round(height * scale));
+      const context = resized.getContext('2d');
+      context.drawImage(image, 0, 0, resized.width, resized.height);
+      image = resized;
+    }
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
@@ -161,8 +175,12 @@ function createStage(canvas, fragment, extra = []) {
     return new Promise((resolve, reject) => {
       const image = new Image();
       image.onload = () => {
-        upload(image);
-        resolve();
+        try {
+          upload(image);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
       };
       image.onerror = reject;
       image.src = source;
@@ -170,7 +188,14 @@ function createStage(canvas, fragment, extra = []) {
   }
 
   // Frame
+  let needsResize = true;
+  const markResize = () => { needsResize = true; };
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(markResize).observe(canvas);
+  window.addEventListener('resize', markResize, { passive: true });
+
   function resize() {
+    if (!needsResize) return;
+    needsResize = false;
     const ratio = Math.min(devicePixelRatio || 1, 2);
     const width = Math.round(canvas.clientWidth * ratio);
     const height = Math.round(canvas.clientHeight * ratio);
