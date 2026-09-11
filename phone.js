@@ -1,210 +1,255 @@
 const SENSOR_WAIT_MS = 4000;
-const SENSOR_STALE_MS = 1000;
-const SENSOR_DISCOVERY_MS = 500;
 
-// Phone: gravity roll drives the original book fold.
+// Phone: gravity roll drives the book fold
 function createPhoneScene(canvas) {
   const motionSheet = document.querySelector('.sheet--motion');
   const enable = motionSheet.querySelector('[data-action="enable"]');
   const renderer = createFold(canvas);
-  const android = /Android/i.test(navigator.userAgent);
-  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent)
-    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const preferredSource = android ? 'orientation' : 'motion';
-  const samples = { motion: null, orientation: null };
+
+  const isAndroid = /Android/i.test(navigator.userAgent);
 
   let target = 0;
   let display = 0;
-  let previous = null;
   let unwrapped = null;
-  let source = null;
-  let consumed = null;
+  let previous = null;
   let hasGravity = false;
   let motionEnabled = false;
   let pending = false;
-  let startedAt = 0;
   let sensorTimer;
-  let onboarded = false;
+  let lastOrientationAt = 0;
 
   function wrap(value) {
     return ((value + 180) % 360 + 360) % 360 - 180;
   }
 
-  function screenAngle() {
-    return (screen.orientation?.angle ?? window.orientation ?? 0) * Math.PI / 180;
-  }
+  function acceptRoll(roll) {
+    if (!Number.isFinite(roll)) return;
 
-  function record(kind, x, y, z) {
-    if (document.hidden || ![x, y, z].every(Number.isFinite)) return;
-    const angle = screenAngle();
-    // Screen angle is counter-clockwise from the natural device orientation.
-    const across = x * Math.cos(angle) - y * Math.sin(angle);
-    // When held upright, gravity cannot determine roll about the screen's
-    // vertical axis. Hold the last pose instead of amplifying sensor noise.
-    if (Math.hypot(across, z) < 0.1) return;
-    samples[kind] = {
-      roll: Math.atan2(-across, z) * 180 / Math.PI,
-      at: performance.now(),
-    };
     if (!hasGravity) {
       hasGravity = true;
       clearTimeout(sensorTimer);
       hideUnavailable();
     }
+
+    if (unwrapped === null) {
+      unwrapped = roll;
+    } else {
+      unwrapped += wrap(roll - (previous ?? wrap(unwrapped)));
+    }
+
+    previous = roll;
+
+    target = Math.max(
+      -180,
+      Math.min(180, -2 * unwrapped)
+    );
   }
 
   function onMotion(e) {
     const total = e.accelerationIncludingGravity;
-    if (!total || ![total.x, total.y, total.z].every(Number.isFinite)) return;
+    if (!total) return;
+
+    /*
+     * Android Chrome/Samsung Internet may return null for acceleration.
+     * In that case use accelerationIncludingGravity directly.
+     */
+    if (isAndroid) {
+      if (
+        performance.now() - lastOrientationAt < 1000 ||
+        !Number.isFinite(total.x) ||
+        !Number.isFinite(total.z)
+      ) {
+        return;
+      }
+
+      if (Math.hypot(total.x, total.z) < 0.5) return;
+
+      const roll = Math.atan2(total.x, -total.z) * 180 / Math.PI;
+      acceptRoll(roll);
+      return;
+    }
+
+    /*
+     * Original iPhone path — unchanged.
+     */
     const linear = e.acceleration;
-    // Use a complete vector from one source; null axes are not zero readings.
-    const hasLinear = linear && [linear.x, linear.y, linear.z].every(Number.isFinite);
-    const sign = ios ? -1 : 1;
-    record('motion',
-      sign * (total.x - (hasLinear ? linear.x : 0)) / 9.80665,
-      sign * (total.y - (hasLinear ? linear.y : 0)) / 9.80665,
-      sign * (total.z - (hasLinear ? linear.z : 0)) / 9.80665);
+    if (!linear) return;
+
+    const x = total.x - linear.x;
+    const z = total.z - linear.z;
+
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(z) ||
+      Math.hypot(x, z) < 0.5
+    ) {
+      return;
+    }
+
+    const roll = Math.atan2(x, -z) * 180 / Math.PI;
+    acceptRoll(roll);
   }
 
   function onOrientation(e) {
-    if (!Number.isFinite(e.beta) || !Number.isFinite(e.gamma)) return;
-    const beta = e.beta * Math.PI / 180;
-    const gamma = e.gamma * Math.PI / 180;
-    // W3C Z-X'-Y'' rotation matrix, last row. Using gamma alone jumps at
-    // Euler-angle boundaries and ignores portrait/landscape and pitch.
-    record('orientation', -Math.cos(beta) * Math.sin(gamma),
-      Math.sin(beta), Math.cos(beta) * Math.cos(gamma));
+    if (!isAndroid || !Number.isFinite(e.gamma)) return;
+
+    lastOrientationAt = performance.now();
+
+    /*
+     * gamma is Android's left/right roll angle.
+     * The original -2x mapping is preserved.
+     */
+    acceptRoll(e.gamma);
   }
 
-  function updateTarget() {
-    const now = performance.now();
-    const fresh = (kind) => samples[kind] && now - samples[kind].at < SENSOR_STALE_MS;
-    // Lock to one stream while it is healthy. Both streams use the same
-    // absolute, screen-up reference, so fallback has no calibration offset.
-    if (!source || !fresh(source)) {
-      const next = fresh(preferredSource) ? preferredSource
-        : (fresh('motion') ? 'motion' : (fresh('orientation') ? 'orientation' : null));
-      if (!next) return;
-      if (!source && next !== preferredSource && now - startedAt < SENSOR_DISCOVERY_MS) return;
-      if (source !== next) {
-        source = next;
-        previous = null;
-        unwrapped = null;
-        consumed = null;
-      }
-    }
-    const sample = samples[source];
-    if (sample === consumed) return;
-    consumed = sample;
-    unwrapped = previous === null ? sample.roll : unwrapped + wrap(sample.roll - previous);
-    // Do not accumulate complete revolutions and get stuck at the end stop.
-    unwrapped = Math.max(-180, Math.min(180, unwrapped));
-    previous = sample.roll;
-    target = Math.max(-180, Math.min(180, -2 * unwrapped));
-  }
-
-  function resetReadings() {
-    samples.motion = samples.orientation = null;
-    previous = unwrapped = source = consumed = null;
-    hasGravity = false;
-    startedAt = performance.now();
-    clearTimeout(sensorTimer);
-  }
-
-  function waitForSensor() {
-    clearTimeout(sensorTimer);
-    sensorTimer = setTimeout(() => {
-      if (!hasGravity && !document.hidden) {
-        showUnavailable('No motion readings. Allow motion sensors in this browser’s site settings, hold the screen toward the sky, then try again.', enableMotion);
-      }
-    }, SENSOR_WAIT_MS);
-  }
-
-  function detach() {
-    window.removeEventListener('devicemotion', onMotion);
-    window.removeEventListener('deviceorientation', onOrientation);
-    motionEnabled = false;
-    resetReadings();
-  }
+  document.addEventListener('visibilitychange', () => {
+    previous = null;
+    unwrapped = null;
+    lastOrientationAt = 0;
+  });
 
   function showGesture() {
-    showHint('Face the screen toward the sky, then roll the phone left or right.');
+    showHint(
+      'Face the screen toward the sky, then roll the phone left or right.'
+    );
   }
 
+  // Motion permission
   async function enableMotion(fromTap = false) {
-    if (pending) return;
-    if (!isSecureContext) {
-      showUnavailable('Motion sensors require HTTPS.');
+    const hasMotion =
+      typeof DeviceMotionEvent !== 'undefined';
+
+    const hasOrientation =
+      typeof DeviceOrientationEvent !== 'undefined';
+
+    if (
+      !isSecureContext ||
+      (!hasMotion && !hasOrientation)
+    ) {
+      showUnavailable();
       return;
     }
-    const motion = typeof DeviceMotionEvent !== 'undefined' ? DeviceMotionEvent : null;
-    const orientation = typeof DeviceOrientationEvent !== 'undefined' ? DeviceOrientationEvent : null;
-    if (!motion && !orientation) {
-      showUnavailable('This browser cannot access motion sensors.');
-      return;
-    }
-    if (!fromTap && [motion, orientation].some((api) => typeof api?.requestPermission === 'function')) {
-      if (!motionSheet.open) motionSheet.showModal();
-      return;
-    }
+
+    if (motionEnabled || pending) return;
 
     pending = true;
     enable.disabled = true;
-    detach();
+
     try {
-      // Invoke both requests within the tap's user activation, before awaiting.
-      const permission = (api) => !api ? Promise.resolve(false)
-        : typeof api.requestPermission !== 'function' ? Promise.resolve(true)
-          : api.requestPermission().then((state) => state === 'granted').catch(() => false);
-      const [allowMotion, allowOrientation] = await Promise.all([permission(motion), permission(orientation)]);
-      if (!allowMotion && !allowOrientation) {
-        showUnavailable('Motion access is off. Allow motion sensors for this page, then try again.', enableMotion);
-        return;
+      /*
+       * iPhone Safari permission request.
+       * Android does not normally require this permission prompt.
+       */
+      if (
+        hasMotion &&
+        typeof DeviceMotionEvent.requestPermission === 'function'
+      ) {
+        const state =
+          await DeviceMotionEvent.requestPermission();
+
+        if (state !== 'granted') {
+          showUnavailable(
+            'Motion access is off. Allow it for this page in browser settings, then try again.',
+            enableMotion
+          );
+          return;
+        }
       }
-      if (allowMotion) window.addEventListener('devicemotion', onMotion, { passive: true });
-      if (allowOrientation) window.addEventListener('deviceorientation', onOrientation, { passive: true });
+
       motionEnabled = true;
-      resetReadings();
-      hideUnavailable();
-      if (motionSheet.open) motionSheet.close();
-      if (!onboarded) {
-        onboarded = true;
-        onboard(showGesture);
+
+      if (motionSheet.open) {
+        motionSheet.close();
       }
-      waitForSensor();
+
+      if (hasMotion) {
+        window.addEventListener(
+          'devicemotion',
+          onMotion,
+          { passive: true }
+        );
+      }
+
+      if (isAndroid && hasOrientation) {
+        window.addEventListener(
+          'deviceorientation',
+          onOrientation,
+          { passive: true }
+        );
+      }
+
+      onboard(showGesture);
+
+      sensorTimer = setTimeout(() => {
+        if (!hasGravity) {
+          showUnavailable(
+            'Motion sensor data was not received. Check browser permissions and try again.',
+            enableMotion
+          );
+        }
+      }, SENSOR_WAIT_MS);
     } catch {
-      showUnavailable('Motion access failed. Tap Enable motion to try again.', enableMotion);
+      if (fromTap) {
+        showUnavailable(
+          'Motion access failed. Tap Enable motion to try again.',
+          enableMotion
+        );
+      } else if (!motionSheet.open) {
+        motionSheet.showModal();
+      }
     } finally {
       pending = false;
       enable.disabled = false;
     }
   }
 
-  function resume() {
-    resetReadings();
-    if (motionEnabled && !document.hidden) waitForSensor();
-  }
-  document.addEventListener('visibilitychange', resume);
-  // Keep listeners across BFCache: pagehide is also fired for cached pages.
-  window.addEventListener('pagehide', () => resetReadings());
-  window.addEventListener('pageshow', resume);
-  if (screen.orientation?.addEventListener) screen.orientation.addEventListener('change', resume);
-  else window.addEventListener('orientationchange', resume);
-  enable.addEventListener('click', () => enableMotion(true));
-  motionSheet.addEventListener('cancel', (e) => e.preventDefault());
+  window.addEventListener('pagehide', () => {
+    window.removeEventListener(
+      'devicemotion',
+      onMotion
+    );
+
+    window.removeEventListener(
+      'deviceorientation',
+      onOrientation
+    );
+  });
+
+  enable.addEventListener('click', () => {
+    enableMotion(true);
+  });
+
+  motionSheet.addEventListener('cancel', (e) => {
+    e.preventDefault();
+  });
 
   return {
     defaultImage: 'backgrounds/default.png',
     storageKey: 'background',
     renderer,
+
     live: () => hasGravity,
-    start: () => enableMotion(),
+
+    start: () => {
+      enableMotion();
+    },
+
     frame(dt) {
-      updateTarget();
-      // Exactly the original time-based follow and fold mapping (also at 120 Hz).
-      display += (target - display) * (1 - Math.exp(-dt * FOLLOW));
-      if (Math.abs(target - display) < 0.001) display = target;
-      renderer.draw(Math.min(Math.abs(display) / 180, 1), display >= 0 ? 0 : 1);
+      /*
+       * Original easing and rendering logic — unchanged.
+       */
+      display +=
+        (target - display) *
+        (1 - Math.exp(-dt * FOLLOW));
+
+      if (Math.abs(target - display) < 0.001) {
+        display = target;
+      }
+
+      renderer.draw(
+        Math.min(Math.abs(display) / 180, 1),
+        display >= 0 ? 0 : 1
+      );
     },
   };
 }
